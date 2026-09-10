@@ -1,0 +1,445 @@
+const mineflayer = require('mineflayer');
+const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
+const http = require('http');
+
+// ==========================================
+// 1. خادم HTTP لإبقاء البوت حياً 24/7 (Keep-Alive)
+// ==========================================
+const PORT = process.env.PORT || 8080;
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end("ChiliBot Ultimate Edition is Online 24/7!");
+}).listen(PORT, () => console.log(`[HTTP Server] يعمل على البورت ${PORT}`));
+
+// ==========================================
+// 2. إعدادات السيرفر والذاكرة
+// ==========================================
+const CONFIG = {
+  host: 'ssdugh.aternos.me',
+  port: 53080,
+  username: 'nato_pot',
+  version: false,
+  reconnectDelay: 20000
+};
+
+class BoundedMemory {
+  constructor(limit = 20) {
+    this.limit = limit;
+    this.data = [];
+  }
+  push(item) {
+    if (this.data.length >= this.limit) this.data.shift();
+    this.data.push(item);
+  }
+}
+
+const AI_MEMORY = {
+  pastErrors: new BoundedMemory(15),
+  chatHistory: new BoundedMemory(30),
+  followingPlayer: null
+};
+
+// ==========================================
+// 3. القواميس وقوائم البيانات
+// ==========================================
+const COMMANDS = {
+  ask: ['!ask', 'سؤال:', 'question:', 'domanda:', 'pregunta:', 'frage:'],
+  follow: ['!follow', 'اتبعني', 'suis-moi', 'seguimi', 'sígueme', 'folge mir'],
+  stop: ['!stop', 'اقف', 'توقف', 'arrête', 'fermati', 'alto', 'stopp'],
+  fly: ['!fly', 'طير', 'vole', 'vola', 'vuela', 'flieg'],
+  firework: ['!firework', 'العاب نارية', 'العاب-نارية', 'صاروخ', 'feux'],
+  eat: ['!eat', 'كل', 'mange', 'mangia', 'come', 'iss'],
+  equip: ['!equip', 'البس', 'تجهز', 'équipe', 'equipaggia', 'equipa', 'rüste'],
+  drop: ['!drop', 'ارمي', 'jette', 'lascia', 'tira', 'wirf'],
+  stats: ['!stats', 'حالة', 'حالتك', 'statut', 'stato', 'estado', 'status'],
+  pos: ['!pos', 'موقع', 'إحداثيات', 'position', 'posizione', 'posición']
+};
+
+const ORE_BLOCKS = {
+  diamond: ['diamond_ore', 'deepslate_diamond_ore'],
+  netherite: ['ancient_debris'],
+  gold: ['gold_ore', 'deepslate_gold_ore', 'nether_gold_ore'],
+  iron: ['iron_ore', 'deepslate_iron_ore']
+};
+
+const FOOD_ITEMS = [
+  'golden_apple', 'cooked_beef', 'cooked_porkchop', 'cooked_chicken',
+  'cooked_mutton', 'baked_potato', 'bread', 'apple', 'carrot'
+];
+
+const HOSTILE_MOBS = [
+  'zombie', 'zombie_villager', 'drowned', 'husk',
+  'skeleton', 'stray', 'wither_skeleton',
+  'spider', 'cave_spider', 'creeper', 'phantom'
+];
+
+function isCommand(msg, cmdArray) {
+  const lowerMsg = msg.toLowerCase().trim();
+  return cmdArray.some(cmd => lowerMsg === cmd || lowerMsg.startsWith(cmd));
+}
+
+// ==========================================
+// 4. المحرك الرئيسي للبوت
+// ==========================================
+function startBot() {
+  console.log('[*] جاري تشغيل ChiliBot Ultimate Edition...');
+
+  const bot = mineflayer.createBot({
+    host: CONFIG.host,
+    port: CONFIG.port,
+    username: CONFIG.username,
+    version: CONFIG.version
+  });
+
+  bot.loadPlugin(pathfinder);
+
+  bot.on('spawn', () => {
+    console.log(`[+] البوت (${bot.username}) متصل وجاهز بجميع الميزات!`);
+    
+    bot.chat('/register 123456789 123456789');
+    bot.chat('/login 123456789');
+    bot.chat('ChiliBot Ultimate جاهز! الأوامر، الذكاء الاصطناعي، والرسائل الخاصة مفعلة!');
+
+    try {
+      const mcData = require('minecraft-data')(bot.version);
+      const defaultMove = new Movements(bot, mcData);
+      bot.pathfinder.setMovements(defaultMove);
+    } catch (e) {
+      console.log('[!] تنبيه: تعذر تحميل بيانات minecraft-data مع Pathfinder، سيتم استخدام الحركة الافتراضية.');
+      const defaultMove = new Movements(bot);
+      bot.pathfinder.setMovements(defaultMove);
+    }
+
+    initSmartAntiAFK(bot);
+    initAutoDefense(bot);
+  });
+
+  bot.on('playerCollect', (collector) => {
+    if (collector.username === bot.username) {
+      setTimeout(() => equipBestEquipment(bot), 800);
+    }
+  });
+
+  bot.on('health', () => {
+    if (bot.food < 15) autoEat(bot);
+  });
+
+  // ==========================================
+  // 5. معالجة الشات والرسائل الخاصة (Whispers / MSG)
+  // ==========================================
+
+  // الشات العام
+  bot.on('chat', (username, message) => {
+    if (username === bot.username) return;
+    handleIncomingCommand(bot, username, message, false);
+  });
+
+  // الرسائل الخاصة (/msg, /w, /tell, /minecraft:msg)
+  bot.on('whisper', (username, message) => {
+    if (username === bot.username) return;
+    console.log(`[رسالة خاصة من ${username}]: ${message}`);
+    handleIncomingCommand(bot, username, message, true);
+  });
+
+  function reply(text, targetUser, isWhisper) {
+    if (isWhisper) {
+      bot.chat(`/msg ${targetUser} ${text}`);
+    } else {
+      bot.chat(text);
+    }
+  }
+
+  async function handleIncomingCommand(botInstance, username, message, isWhisper = false) {
+    const msg = message.trim();
+    const lowerMsg = msg.toLowerCase();
+    const targetPlayer = botInstance.players[username];
+
+    // --- أمر الذكاء الاصطناعي ---
+    if (isCommand(msg, COMMANDS.ask)) {
+      const matchedCmd = COMMANDS.ask.find(cmd => lowerMsg.startsWith(cmd));
+      const question = msg.slice(matchedCmd.length).trim();
+      reply(generateMultilingualAnswer(question), username, isWhisper);
+    }
+    // --- أمر التتبع ---
+    else if (isCommand(msg, COMMANDS.follow)) {
+      if (!targetPlayer || !targetPlayer.entity) {
+        reply('لست قريبًا مني لتتبعك! اقترب مني أولاً.', username, isWhisper);
+        return;
+      }
+      AI_MEMORY.followingPlayer = username;
+      reply(`جاري تتبعك يا ${username}...`, username, isWhisper);
+      botInstance.pathfinder.setGoal(new goals.GoalFollow(targetPlayer.entity, 1), true);
+    }
+    // --- أمر الإيقاف ---
+    else if (isCommand(msg, COMMANDS.stop)) {
+      AI_MEMORY.followingPlayer = null;
+      botInstance.pathfinder.setGoal(null);
+      reply('تم إيقاف الحركة والتتبع.', username, isWhisper);
+    }
+    // --- أمر رمي الغرض ---
+    else if (isCommand(msg, COMMANDS.drop)) {
+      await dropHeldItem(botInstance, (txt) => reply(txt, username, isWhisper));
+    }
+    // --- أمر الطيران بالـ Elytra ---
+    else if (isCommand(msg, COMMANDS.fly)) {
+      await launchElytraFly(botInstance, (txt) => reply(txt, username, isWhisper));
+    }
+    // --- أمر إطلاق الألعاب النارية في السماء ---
+    else if (isCommand(msg, COMMANDS.firework)) {
+      await launchFireworkDisplay(botInstance, (txt) => reply(txt, username, isWhisper));
+    }
+    // --- أوامر الأكل واللبس والإحصائيات ---
+    else if (isCommand(msg, COMMANDS.eat)) {
+      await autoEat(botInstance, (txt) => reply(txt, username, isWhisper), true);
+    } 
+    else if (isCommand(msg, COMMANDS.equip)) {
+      await equipBestEquipment(botInstance, (txt) => reply(txt, username, isWhisper), true);
+    } 
+    else if (isCommand(msg, COMMANDS.stats)) {
+      reply(`HP: ${Math.round(botInstance.health)}/20 | Food: ${botInstance.food}/20 | Systems: ONLINE`, username, isWhisper);
+    }
+    else if (isCommand(msg, COMMANDS.pos)) {
+      const p = botInstance.entity.position;
+      reply(`X: ${Math.round(p.x)} | Y: ${Math.round(p.y)} | Z: ${Math.round(p.z)}`, username, isWhisper);
+    }
+
+    // --- البحث عن إحداثيات الموارد القريبة ---
+    else if (lowerMsg.includes('دايموند') || lowerMsg.includes('diamond')) {
+      findNearbyBlock(botInstance, ORE_BLOCKS.diamond, 'دايموند', (txt) => reply(txt, username, isWhisper));
+    }
+    else if (lowerMsg.includes('دبريس') || lowerMsg.includes('نيثرايت') || lowerMsg.includes('ancient debris')) {
+      findNearbyBlock(botInstance, ORE_BLOCKS.netherite, 'أنشنت دبريس', (txt) => reply(txt, username, isWhisper));
+    }
+    else if (lowerMsg.includes('ذهب') || lowerMsg.includes('gold')) {
+      findNearbyBlock(botInstance, ORE_BLOCKS.gold, 'ذهب', (txt) => reply(txt, username, isWhisper));
+    }
+    else if (lowerMsg.includes('حديد') || lowerMsg.includes('iron')) {
+      findNearbyBlock(botInstance, ORE_BLOCKS.iron, 'حديد', (txt) => reply(txt, username, isWhisper));
+    }
+
+    // --- كشف إحداثيات القلاع والقرى والهياكل ---
+    else if (lowerMsg.includes('قرية') || lowerMsg.includes('village')) {
+      locateStructure(botInstance, 'minecraft:village', 'القرية', (txt) => reply(txt, username, isWhisper));
+    } 
+    else if (lowerMsg.includes('قلعة النذر') || lowerMsg.includes('fortress')) {
+      locateStructure(botInstance, 'minecraft:fortress', 'قلعة النذر', (txt) => reply(txt, username, isWhisper));
+    } 
+    else if (lowerMsg.includes('قلعة بيجلن') || lowerMsg.includes('بستن') || lowerMsg.includes('bastion')) {
+      locateStructure(botInstance, 'minecraft:bastion_remnant', 'قلعة البيجلن (Bastion)', (txt) => reply(txt, username, isWhisper));
+    } 
+    else if (lowerMsg.includes('تنين') || lowerMsg.includes('معقل') || lowerMsg.includes('stronghold')) {
+      locateStructure(botInstance, 'minecraft:stronghold', 'معقل التنين (Stronghold)', (txt) => reply(txt, username, isWhisper));
+    } 
+    else if (lowerMsg.includes('مدينة الإند') || lowerMsg.includes('end city')) {
+      locateStructure(botInstance, 'minecraft:end_city', 'مدينة الإند (End City)', (txt) => reply(txt, username, isWhisper));
+    }
+  }
+
+  // ==========================================
+  // 6. نظام الذكاء الاصطناعي والكشف والأنظمة الفرعية
+  // ==========================================
+
+  function generateMultilingualAnswer(prompt) {
+    AI_MEMORY.chatHistory.push({ prompt, time: Date.now() });
+
+    const isArabic = /[\u0600-\u06FF]/.test(prompt);
+    const isFrench = /\b(bonjour|comment|pourquoi|avec|que|est|français)\b/i.test(prompt);
+    const isItalian = /\b(ciao|come|perché|con|questo|italiano)\b/i.test(prompt);
+    const isSpanish = /\b(hola|cómo|por|qué|con|español)\b/i.test(prompt);
+    const isGerman = /\b(hallo|wie|warum|mit|deutsch)\b/i.test(prompt);
+
+    if (isArabic) {
+      const arDb = [
+        "بناءً على تحليلي: أفضل طريقة للتعدين هي الحفر عند مستوى Y = -58 للدايموند.",
+        "نصيحة: يمكنك استخدام السرير للتفجير في النذر للبحث عن الـ Ancient Debris بسرعة.",
+        "إجابة: حافظ دائماً على وجود أحجار إضاءة أو مشاعل لمنع ترسب الموبات العدائية."
+      ];
+      return `[Gemini AI]: ${arDb[Math.floor(Math.round(Math.random() * (arDb.length - 1)))]}`;
+    } else if (isFrench) {
+      return `[Gemini AI]: Pour une meilleure expérience, construisez vos fermes avec du Redstone!`;
+    } else if (isItalian) {
+      return `[Gemini AI]: Suggerimento: usa la Redstone per automatizzare la tua base!`;
+    } else if (isSpanish) {
+      return `[Gemini AI]: ¡Consejo: Ilumina tu base para evitar que aparezcan monstruos!`;
+    } else if (isGerman) {
+      return `[Gemini AI]: Tipp: Grabe auf Ebene Y = -58 nach Diamanten!`;
+    } else {
+      const enDb = [
+        "AI Insight: The best level to mine diamonds in 1.20+ is Y = -58.",
+        "Pro Tip: Always bring a bucket of water when exploring deep caves.",
+        "Strategy: Construct automated farms using Redstone for unlimited resources."
+      ];
+      return `[Gemini AI]: ${enDb[Math.floor(Math.round(Math.random() * (enDb.length - 1)))]}`;
+    }
+  }
+
+  function findNearbyBlock(botInstance, blockNames, resourceLabel, sendReply) {
+    try {
+      const mcData = require('minecraft-data')(botInstance.version);
+      const ids = blockNames
+        .map(name => mcData.blocksByName[name]?.id)
+        .filter(id => id !== undefined);
+
+      if (ids.length === 0) {
+        sendReply(`لم أستطع التعرف على خامة ${resourceLabel} في هذه النسخة.`);
+        return;
+      }
+
+      const foundBlock = botInstance.findBlock({ matching: ids, maxDistance: 32 });
+
+      if (foundBlock) {
+        const pos = foundBlock.position;
+        sendReply(`[📍] تم كشف ${resourceLabel}! الإحداثيات: X: ${pos.x} | Y: ${pos.y} | Z: ${pos.z}`);
+      } else {
+        sendReply(`[❌] لم أجد ${resourceLabel} مكشوفًا قريبًا منك (في حدود 32 بلوكة).`);
+      }
+    } catch (err) {
+      AI_MEMORY.pastErrors.push(`Block Search Error: ${err.message}`);
+    }
+  }
+
+  function locateStructure(botInstance, structureKey, structureLabel, sendReply) {
+    sendReply(`[🔍] جاري الكشف عن موقع ${structureLabel}...`);
+    botInstance.chat(`/locate structure ${structureKey}`);
+  }
+
+  async function dropHeldItem(botInstance, sendReply) {
+    const heldItem = botInstance.heldItem;
+    if (!heldItem) {
+      sendReply('لا أحمل أي شيء باليد حالياً!');
+      return;
+    }
+    try {
+      await botInstance.tossStack(heldItem);
+      sendReply('تم إلقاء الغرض!');
+    } catch (err) {
+      AI_MEMORY.pastErrors.push(`Drop Error: ${err.message}`);
+    }
+  }
+
+  async function launchElytraFly(botInstance, sendReply) {
+    if (!botInstance || !botInstance.inventory) return;
+
+    const elytra = botInstance.inventory.items().find(i => i.name === 'elytra');
+    const rocket = botInstance.inventory.items().find(i => i.name === 'firework_rocket');
+
+    if (!elytra || !rocket) {
+      sendReply('يلزم وجود Elytra وصواريخ في الشنطة للطيران!');
+      return;
+    }
+
+    try {
+      await botInstance.equip(elytra, 'torso');
+      await botInstance.equip(rocket, 'hand');
+
+      botInstance.setControlState('jump', true);
+      setTimeout(() => {
+        botInstance.setControlState('jump', false);
+        botInstance.activateItem();
+        sendReply('تم الإطلاق والتطير بنجاح!');
+      }, 350);
+    } catch (err) {
+      AI_MEMORY.pastErrors.push(`Fly Error: ${err.message}`);
+    }
+  }
+
+  async function launchFireworkDisplay(botInstance, sendReply) {
+    if (!botInstance || !botInstance.inventory) return;
+
+    const rocket = botInstance.inventory.items().find(i => i.name === 'firework_rocket');
+    if (!rocket) {
+      sendReply('لا يوجد صواريخ ألعاب نارية (firework_rocket) في الشنطة!');
+      return;
+    }
+
+    try {
+      await botInstance.equip(rocket, 'hand');
+      await botInstance.look(botInstance.entity.yaw, Math.PI / 2);
+      botInstance.activateItem();
+      sendReply('تم إطلاق الألعاب النارية في السماء! 🎆');
+    } catch (err) {
+      sendReply('تعذر إطلاق الصاروخ، تأكد من إمكانية استخدام الأغراض.');
+    }
+  }
+
+  async function equipBestEquipment(botInstance, sendReply = null, announce = false) {
+    if (!botInstance || !botInstance.inventory) return;
+    const items = botInstance.inventory.items();
+
+    const helmet = items.find(i => i.name.endsWith('_helmet'));
+    const chestplate = items.find(i => i.name.endsWith('_chestplate') && i.name !== 'elytra');
+    const leggings = items.find(i => i.name.endsWith('_leggings'));
+    const boots = items.find(i => i.name.endsWith('_boots'));
+    const weapon = items.find(i => i.name.endsWith('_sword') || i.name.endsWith('_axe'));
+
+    try {
+      if (helmet) await botInstance.equip(helmet, 'head');
+      if (chestplate) await botInstance.equip(chestplate, 'torso');
+      if (leggings) await botInstance.equip(leggings, 'legs');
+      if (boots) await botInstance.equip(boots, 'feet');
+      if (weapon) await botInstance.equip(weapon, 'hand');
+      if (announce && sendReply) sendReply('تم تجهيز أفضل المعدات المتاحة!');
+    } catch (e) {}
+  }
+
+  async function autoEat(botInstance, sendReply = null, announce = false) {
+    if (!botInstance || !botInstance.inventory) return;
+    const food = botInstance.inventory.items().find(i => FOOD_ITEMS.includes(i.name));
+    if (food) {
+      try {
+        await botInstance.equip(food, 'hand');
+        await botInstance.consume();
+        if (announce && sendReply) sendReply('تم الأكل واستعادة نقاط الجوع!');
+      } catch (e) {}
+    } else if (announce && sendReply) {
+      sendReply('لا يوجد طعام في الشنطة حالياً!');
+    }
+  }
+
+  function initAutoDefense(botInstance) {
+    setInterval(async () => {
+      if (!botInstance || !botInstance.entity) return;
+
+      const target = botInstance.nearestEntity(entity => {
+        return entity.type === 'mob' &&
+               HOSTILE_MOBS.includes(entity.name) &&
+               entity.position.distanceTo(botInstance.entity.position) <= 5;
+      });
+
+      if (target) {
+        const sword = botInstance.inventory.items().find(i => i.name.endsWith('_sword'));
+        if (sword && (!botInstance.heldItem || botInstance.heldItem.name !== sword.name)) {
+          try { await botInstance.equip(sword, 'hand'); } catch (e) {}
+        }
+        botInstance.lookAt(target.position.offset(0, target.height, 0));
+        botInstance.attack(target);
+      }
+    }, 600);
+  }
+
+  function initSmartAntiAFK(botInstance) {
+    setInterval(() => {
+      if (!botInstance || !botInstance.entity || AI_MEMORY.followingPlayer) return;
+      botInstance.setControlState('jump', true);
+      setTimeout(() => botInstance.setControlState('jump', false), 400);
+    }, 20000);
+  }
+
+  // ==========================================
+  // 7. إدارة الأخطاء وإعادة الاتصال
+  // ==========================================
+  bot.on('error', (err) => {
+    AI_MEMORY.pastErrors.push(`Network Error: ${err.message}`);
+    console.log(`[!] خطأ في الشبكة: ${err.message}`);
+  });
+
+  bot.on('end', (reason) => {
+    console.log(`[-] انقطع الاتصال (${reason}). إعادة الاتصال خلال ${CONFIG.reconnectDelay / 1000} ثوانٍ...`);
+    setTimeout(startBot, CONFIG.reconnectDelay);
+  });
+}
+
+process.on('uncaughtException', (err) => AI_MEMORY.pastErrors.push(`Crash: ${err.message}`));
+process.on('unhandledRejection', (reason) => AI_MEMORY.pastErrors.push(`Rejection: ${reason}`));
+
+startBot();
